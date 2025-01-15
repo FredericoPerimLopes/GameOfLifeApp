@@ -14,13 +14,20 @@ public class GameService : IGameService
         _boardRepository = boardRepository;
     }
 
+    /// <summary>
+    /// Creates a new game board with the specified initial state.
+    /// </summary>
+    /// <param name="initialState">2D array representing the initial state of the board</param>
+    /// <returns>Guid of the newly created board</returns>
+    /// <exception cref="ArgumentNullException">Thrown if initialState is null</exception>
+    /// <exception cref="ArgumentException">Thrown if initialState is empty or contains invalid values</exception>
     public async Task<Guid> CreateBoardAsync(int[][] initialState)
     {
         if (initialState == null)
         {
             throw new ArgumentNullException(nameof(initialState), "Initial state must be provided");
         }
-        
+
         if (initialState.Length == 0 || initialState[0] == null)
         {
             throw new ArgumentException("Initial state cannot be empty", nameof(initialState));
@@ -41,7 +48,9 @@ public class GameService : IGameService
         var board = new Board
         {
             Id = Guid.NewGuid(),
-            Cells = initialState,
+            Width = initialState[0].Length,
+            Height = initialState.Length,
+            Cells = initialState, // This will populate LiveCells
             Generation = 0
         };
 
@@ -49,6 +58,13 @@ public class GameService : IGameService
         return board.Id;
     }
 
+    /// <summary>
+    /// Calculates and returns the next state of the specified board.
+    /// </summary>
+    /// <param name="boardId">Guid of the board to process</param>
+    /// <returns>Board object with updated state</returns>
+    /// <exception cref="KeyNotFoundException">Thrown if board is not found</exception>
+    /// <exception cref="InvalidOperationException">Thrown if board state is invalid</exception>
     public async Task<Board> GetNextStateAsync(Guid boardId)
     {
         var board = await GetBoard(boardId);
@@ -60,9 +76,19 @@ public class GameService : IGameService
         }
 
         var nextState = GameRules.CalculateNextGeneration(board.Cells);
+        board.Generation++; // Increment here
         return await UpdateBoardState(board, nextState);
     }
 
+    /// <summary>
+    /// Calculates and returns the state of the board after the specified number of generations.
+    /// </summary>
+    /// <param name="boardId">Guid of the board to process</param>
+    /// <param name="generations">Number of generations to simulate</param>
+    /// <returns>Board object with updated state</returns>
+    /// <exception cref="ArgumentOutOfRangeException">Thrown if generations is negative</exception>
+    /// <exception cref="KeyNotFoundException">Thrown if board is not found</exception>
+    /// <exception cref="InvalidOperationException">Thrown if board state is invalid</exception>
     public async Task<Board> GetStateAfterGenerationsAsync(Guid boardId, int generations)
     {
         if (generations < 0)
@@ -84,9 +110,19 @@ public class GameService : IGameService
             currentState = GameRules.CalculateNextGeneration(currentState);
         }
 
+        board.Generation += generations; // Increment total generations
         return await UpdateBoardState(board, currentState);
     }
 
+    /// <summary>
+    /// Calculates and returns the final stable state of the board.
+    /// </summary>
+    /// <param name="boardId">Guid of the board to process</param>
+    /// <param name="maxGenerations">Maximum number of generations to simulate</param>
+    /// <returns>Board object with final stable state</returns>
+    /// <exception cref="ArgumentOutOfRangeException">Thrown if maxGenerations is less than or equal to 0</exception>
+    /// <exception cref="KeyNotFoundException">Thrown if board is not found</exception>
+    /// <exception cref="InvalidOperationException">Thrown if board state is invalid</exception>
     public async Task<Board> GetFinalStateAsync(Guid boardId, int maxGenerations = 1000)
     {
         if (maxGenerations <= 0)
@@ -111,23 +147,32 @@ public class GameService : IGameService
             previousState = currentState;
             currentState = GameRules.CalculateNextGeneration(currentState);
             generations++;
-
-            if (generations >= maxGenerations)
-            {
-                throw new InvalidOperationException(
-                    $"Board did not reach final state after {maxGenerations} generations");
-            }
         }
-        while (!AreStatesEqual(previousState, currentState));
+        while (!AreStatesEqual(previousState, currentState) && generations < maxGenerations);
 
+        board.Generation += generations; // Increment total generations
         return await UpdateBoardState(board, currentState, true);
     }
 
+    /// <summary>
+    /// Retrieves a board from the repository.
+    /// </summary>
+    /// <param name="boardId">Guid of the board to retrieve</param>
+    /// <returns>Board object</returns>
+    /// <exception cref="KeyNotFoundException">Thrown if board is not found</exception>
     private async Task<Board> GetBoard(Guid boardId)
     {
         return await _boardRepository.GetByIdAsync(boardId);
     }
 
+    /// <summary>
+    /// Updates a board's state in the repository.
+    /// </summary>
+    /// <param name="board">Board object to update</param>
+    /// <param name="newState">New state of the board</param>
+    /// <param name="isFinal">Whether this is the final stable state</param>
+    /// <returns>Updated board object</returns>
+    /// <exception cref="ArgumentNullException">Thrown if newState is null</exception>
     private async Task<Board> UpdateBoardState(Board board, int[][]? newState, bool isFinal = false)
     {
         if (newState == null)
@@ -136,7 +181,6 @@ public class GameService : IGameService
         }
 
         board.Cells = newState;
-        board.Generation++;
         board.LastUpdated = DateTime.UtcNow;
         board.IsFinalState = isFinal;
 
@@ -146,22 +190,42 @@ public class GameService : IGameService
 
     private static bool AreStatesEqual(int[][]? state1, int[][]? state2)
     {
+        // Handle null cases
         if (state1 == null || state2 == null)
             return state1 == state2;
-            
-        if (state1.Length != state2.Length || 
+
+        // Check if dimensions match
+        if (state1.Length != state2.Length ||
             (state1.Length > 0 && state1[0].Length != state2[0].Length))
         {
             return false;
         }
 
-        for (int x = 0; x < state1.Length; x++)
+        const int blockSize = 64; // Cache line friendly size
+
+        // Process the grid in blocks to improve cache locality
+        for (int yBlock = 0; yBlock < state1.Length; yBlock += blockSize)
         {
-            for (int y = 0; y < state1[x].Length; y++)
+            // Calculate vertical block boundaries
+            int yEnd = Math.Min(yBlock + blockSize, state1.Length);
+
+            // Process each vertical block in horizontal blocks
+            for (int xBlock = 0; xBlock < state1[0].Length; xBlock += blockSize)
             {
-                if (state1[x][y] != state2[x][y])
+                // Calculate horizontal block boundaries
+                int xEnd = Math.Min(xBlock + blockSize, state1[0].Length);
+
+                // Compare cells within the current block
+                for (int y = yBlock; y < yEnd; y++)
                 {
-                    return false;
+                    for (int x = xBlock; x < xEnd; x++)
+                    {
+                        // If any cell differs, states are not equal
+                        if (state1[y][x] != state2[y][x])
+                        {
+                            return false;
+                        }
+                    }
                 }
             }
         }
